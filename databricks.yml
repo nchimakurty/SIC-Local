@@ -1,0 +1,112 @@
+# Databricks Asset Bundle configuration, more info here: https://docs.databricks.com/en/dev-tools/bundles/settings.html
+bundle:
+  name: "sf-lakeflow-connect"
+
+include:
+  - ./variables/sfdc_sfcloud_cv.yml
+  - ./resources/pipelines/sfdc_sfcloud_cv.pipeline.yml
+  - ./resources/jobs/sfdc_sfcloud_cv.job.yml
+  # - resources/*/*.yml
+  # - variables/*.yml      # this dab specific variables
+  # - ../variables/*.yml   # shared variables are here
+
+# define variables
+# variables:
+#   var_connection_name: 
+#     description: connection_name
+#     default: salesforce_cv_dev_lads
+
+#   var_destination_catalog: 
+#     description: d_silver_ods
+#     default: d_silver_ods
+
+#   var_destination_schema: 
+#     description: sfdc_sfcloud_cv
+#     default: sfdc_sfcloud_cv    
+
+  # var_pipeline_id:
+  #   description: "get the pipeline id using a lookup variable"
+  #   lookup:
+  #     pipeline: "[${bundle.target} ${workspace.current_user.short_name}] sfdc_sfcloud_cv"
+
+targets:
+  # The 'dev' target, for development purposes. This target is the default.
+  dev2.1:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-2406194429519310.10.azuredatabricks.net
+
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-5673191617894007.7.azuredatabricks.net/
+
+    variables:
+      var_destination_catalog: 
+        description: dev_silver
+        default: dev_silver
+
+      var_connection_name: 
+        description: connection_name
+        default: salesforce_cv_np_lads
+
+  non-prod2.1:
+    mode: development
+    workspace:
+      host: https://adb-2406194429519310.10.azuredatabricks.net
+
+    variables:
+      var_connection_name: 
+        description: connection_name
+        default: salesforce_cv_np_lads
+
+      var_destination_catalog: 
+        description: n_silver_ods
+        default: n_silver_ods
+
+      var_destination_schema: 
+        description: sfdc_sfcloud_cv
+        default: sfdc_sfcloud_cv
+
+      # var_pipeline_id:
+      #   description: "get the pipeline id using a lookup variable"
+      #   lookup:
+      #     pipeline: "sfdc_sfcloud_cv"
+
+  non-prod:
+    mode: development
+    workspace:
+      host: https://adb-3020723097480673.13.azuredatabricks.net
+
+    variables:
+      var_connection_name: 
+        description: connection_name
+        default: salesforce_cv_np_lads
+
+      var_destination_catalog: 
+        description: np_silver
+        default: np_silver
+
+      var_destination_schema: 
+        description: sfdc_sfcloud_cv
+        default: sfdc_sfcloud_cv
+
+      # var_pipeline_id:
+      #   description: "get the pipeline id using a lookup variable"
+      #   lookup:
+      #     pipeline: "sfdc_sfcloud_cv"
+
+
+  # The 'prod' target, used for production deployment.
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-2406194429519310.10.azuredatabricks.net
+      # We always use /Users/bill.pickett@standard.com for all resources to make sure we only have a single copy.
+      root_path: /Users/bill.pickett@standard.com/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      # This runs as bill.pickett@standard.com in production. We could also use a service principal here,
+      # see https://docs.databricks.com/dev-tools/bundles/permissions.html.
+      user_name: bill.pickett@standard.com

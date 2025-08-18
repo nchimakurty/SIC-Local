@@ -1,0 +1,20 @@
+resources:
+  jobs:
+    sfdc_sfcloud_cv_job:
+      name: sfdc_sfcloud_cv job
+      schedule:
+        quartz_cron_expression: 0 0/5 * * * ?
+        timezone_id: UTC
+        pause_status: PAUSED
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: sfdc_sfcloud_cv_job
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.pipeline_sfdc_sfcloud_cv.id}
+            full_refresh: false
+      performance_target: PERFORMANCE_OPTIMIZED
+      tags:
+        dev: WFD
+      queue:
+        enabled: false      
+

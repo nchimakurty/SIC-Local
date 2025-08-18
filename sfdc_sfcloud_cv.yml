@@ -1,0 +1,17 @@
+variables:
+  var_connection_name: 
+    description: connection_name
+    default: salesforce_cv_dev_lads
+
+  var_destination_catalog: 
+    description: d_silver_ods
+    default: d_silver_ods
+
+  var_destination_schema: 
+    description: sfdc_sfcloud_cv
+    default: sfdc_sfcloud_cv    
+
+  # var_pipeline_id:
+  #   description: "get the pipeline id using a lookup variable"
+  #   lookup:
+  #     pipeline: "[${bundle.target} ${workspace.current_user.short_name}] sfdc_sfcloud_cv"

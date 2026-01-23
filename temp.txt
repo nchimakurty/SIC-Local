@@ -1,1 +1,234 @@
-Queries with streaming sources must be executed with writeStream.start(), or from a streaming table or flow definition within a Lakeflow Declarative Pipeline.
+-- Schemas
+CREATE SCHEMA IF NOT EXISTS main.d_bronze;
+CREATE SCHEMA IF NOT EXISTS main.d_silver;
+CREATE SCHEMA IF NOT EXISTS main.control;
+
+-- Status table for CDF version tracking
+CREATE TABLE IF NOT EXISTS main.control.cdf_status (
+  source_table            STRING,
+  last_processed_version  BIGINT,
+  last_processed_timestamp TIMESTAMP,
+  last_batch_id           STRING,
+  versions_processed      BIGINT,
+  PRIMARY KEY (source_table)
+) USING DELTA;
+
+-- Bronze (append-only) with CDF enabled
+CREATE TABLE IF NOT EXISTS main.d_bronze.customer_bronze (
+  customer_id       STRING,
+  customer_name     STRING,
+  email_address     STRING,
+  is_active         BOOLEAN,
+  record_timestamp  TIMESTAMP,
+  loaded_at_utc     TIMESTAMP
+)
+USING DELTA
+TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+-- Silver ODS (SCD1, active-only)
+CREATE TABLE IF NOT EXISTS main.d_silver.ods_customer (
+  customer_id          STRING,
+  customer_name        STRING,
+  email_address        STRING,
+  record_timestamp     TIMESTAMP,
+  bronze_loaded_at_utc TIMESTAMP,
+  loaded_at_utc        TIMESTAMP,
+  modified_at_utc      TIMESTAMP,
+  _etl_batch_id        STRING
+)
+USING DELTA;
+
+-- Sample data
+INSERT INTO main.d_bronze.customer_bronze VALUES
+  ('C001','Alice','alice@example.com',true,current_timestamp(),current_timestamp()),
+  ('C002','Bob','bob@example.com',true,current_timestamp(),current_timestamp()),
+  ('C003','Carol','carol@example.com',true,current_timestamp(),current_timestamp());
+
+
+# ===========================
+# Cell 1 – Parameters
+# ===========================
+dbutils.widgets.text("bronze_table",  "main.d_bronze.customer_bronze")
+dbutils.widgets.text("ods_table",     "main.d_silver.ods_customer")
+dbutils.widgets.text("status_table",  "main.control.cdf_status")
+dbutils.widgets.text("key_columns",   "customer_id")
+dbutils.widgets.text("data_columns",  "customer_name,email_address,record_timestamp")
+
+# ===========================
+# Cell 2 – Setup
+# ===========================
+from delta.tables import DeltaTable
+from pyspark.sql.functions import (
+    current_timestamp, lit, col, max as spark_max, row_number
+)
+from pyspark.sql.window import Window
+import datetime as dt
+
+bronze_table  = dbutils.widgets.get("bronze_table")
+ods_table     = dbutils.widgets.get("ods_table")
+status_table  = dbutils.widgets.get("status_table")
+key_cols      = [c.strip() for c in dbutils.widgets.get("key_columns").split(",") if c.strip()]
+data_cols     = [c.strip() for c in dbutils.widgets.get("data_columns").split(",") if c.strip()]
+
+batch_id = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+print(f"Bronze table : {bronze_table}")
+print(f"ODS table    : {ods_table}")
+print(f"Status table : {status_table}")
+print(f"Keys         : {key_cols}")
+print(f"Data cols    : {data_cols}")
+print(f"Batch ID     : {batch_id}")
+
+# ===========================
+# Cell 3 – Get last processed CDF version
+# ===========================
+last_version_query = f"""
+    SELECT last_processed_version
+    FROM {status_table}
+    WHERE source_table = '{bronze_table}'
+"""
+
+try:
+    rows = spark.sql(last_version_query).collect()
+    if rows and rows[0]["last_processed_version"] is not None:
+        start_version = rows[0]["last_processed_version"] + 1
+    else:
+        start_version = 0
+except Exception:
+    # Status table empty or missing record
+    start_version = 0
+
+print(f"Starting from CDF version: {start_version}")
+
+# ===========================
+# Cell 4 – Read CDF changes (append-only → inserts only)
+# ===========================
+cdf_query = f"""
+  SELECT *, _commit_version
+  FROM table_changes('{bronze_table}', {start_version})
+  WHERE _change_type = 'insert'
+"""
+
+df_changes = spark.sql(cdf_query)
+
+if df_changes.limit(1).count() == 0:
+    print(f"No new changes since version {start_version}")
+    dbutils.notebook.exit("NO_CHANGES")
+
+changes_count   = df_changes.count()
+max_version     = df_changes.agg(spark_max("_commit_version")).collect()[0][0]
+versions_proc   = max_version - start_version + 1
+
+print(f"New inserts          : {changes_count}")
+print(f"CDF version range    : {start_version} → {max_version}")
+print(f"CDF versions processed: {versions_proc}")
+
+# ===========================
+# Cell 5 – Prepare source (SCD1, active-only, latest per key)
+# ===========================
+# Latest record per key (in case multiple inserts per customer)
+w = Window.partitionBy(*key_cols).orderBy(col("_commit_version").desc())
+
+df_latest = (
+    df_changes
+    .withColumn("rn", row_number().over(w))
+    .filter(col("rn") == 1)
+    .drop("rn")
+)
+
+# Split active vs inactive based on is_active flag
+df_active   = df_latest.filter(col("is_active") == True)
+df_inactive = df_latest.filter(col("is_active") == False)
+
+# Prepare active records for upsert into ODS
+df_source = (
+    df_active
+    .drop("_change_type", "_commit_version", "_commit_timestamp", "is_active")
+    .withColumnRenamed("loaded_at_utc", "bronze_loaded_at_utc")
+    .withColumn("loaded_at_utc",   current_timestamp())
+    .withColumn("modified_at_utc", current_timestamp())
+    .withColumn("_etl_batch_id",   lit(batch_id))
+)
+
+print(f"Active records to upsert : {df_source.count()}")
+print(f"Inactive records to delete: {df_inactive.count()}")
+
+# ===========================
+# Cell 6 – MERGE into ODS (SCD1) + delete inactive
+# ===========================
+delta_ods  = DeltaTable.forName(spark, ods_table)
+join_expr  = " AND ".join([f"t.{c} = s.{c}" for c in key_cols])
+
+# --- UPSERT active records (SCD1) ---
+if df_source.limit(1).count() > 0:
+    # columns to update (do NOT touch loaded_at_utc)
+    update_set = {c: f"s.{c}" for c in (data_cols + ["bronze_loaded_at_utc", "_etl_batch_id"])}
+    update_set["modified_at_utc"] = "current_timestamp()"
+    
+    # columns to insert
+    insert_vals = {c: f"s.{c}" for c in (key_cols + data_cols + ["bronze_loaded_at_utc", "_etl_batch_id"])}
+    insert_vals["loaded_at_utc"]   = "current_timestamp()"
+    insert_vals["modified_at_utc"] = "current_timestamp()"
+    
+    (
+        delta_ods.alias("t")
+        .merge(df_source.alias("s"), join_expr)
+        .whenMatchedUpdate(set=update_set)
+        .whenNotMatchedInsert(values=insert_vals)
+        .execute()
+    )
+    print(f"✓ UPSERT complete: {df_source.count()} active records merged")
+
+# --- DELETE inactive records from ODS ---
+if df_inactive.limit(1).count() > 0:
+    deleted_keys = df_inactive.select(*key_cols).distinct()
+    delete_join  = " AND ".join([f"t.{k} = d.{k}" for k in key_cols])
+    
+    (
+        delta_ods.alias("t")
+        .merge(deleted_keys.alias("d"), delete_join)
+        .whenMatchedDelete()
+        .execute()
+    )
+    print(f"✓ DELETE complete: {df_inactive.count()} inactive records removed from ODS")
+
+
+# ===========================
+# Cell 7 – Update CDF status
+# ===========================
+status_merge = f"""
+    MERGE INTO {status_table} t
+    USING (
+        SELECT
+            '{bronze_table}'      AS source_table,
+            {max_version}         AS last_processed_version,
+            current_timestamp()   AS last_processed_timestamp,
+            '{batch_id}'          AS last_batch_id,
+            {versions_proc}       AS versions_processed
+    ) s
+    ON t.source_table = s.source_table
+    WHEN MATCHED THEN UPDATE SET
+        t.last_processed_version  = s.last_processed_version,
+        t.last_processed_timestamp = s.last_processed_timestamp,
+        t.last_batch_id           = s.last_batch_id,
+        t.versions_processed      = s.versions_processed
+    WHEN NOT MATCHED THEN INSERT *
+"""
+
+spark.sql(status_merge)
+
+print(f"✓ Status updated: version {start_version} → {max_version}")
+
+# ===========================
+# Cell 8 – Final validation
+# ===========================
+ods_count = spark.sql(f"SELECT COUNT(*) AS total FROM {ods_table}").collect()[0]["total"]
+
+print("===== RUN SUMMARY =====")
+print(f"ODS total active rows  : {ods_count}")
+print(f"Bronze CDF versions    : {start_version} → {max_version}")
+print(f"CDF versions processed : {versions_proc}")
+print(f"Batch ID               : {batch_id}")
+print("========================")
+
+

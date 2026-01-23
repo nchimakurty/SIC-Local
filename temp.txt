@@ -1,30 +1,133 @@
-Description
+--Create Bronze table with CDF enabled
 
-OUTCOME: This would be the starting point for all other work
+CREATE SCHEMA IF NOT EXISTS main.d_bronze;
 
-OUTCOME: The notebook can just copy the data
+CREATE TABLE IF NOT EXISTS main.d_bronze.customer_bronze (
+  customer_id       STRING,
+  customer_name     STRING,
+  email_address     STRING,
+  is_active         BOOLEAN,
+  record_timestamp  TIMESTAMP
+)
+USING DELTA
+TBLPROPERTIES (delta.enableChangeDataFeed = true);
 
-OUTCOME: It can be fired off after the data simulator has been created (Try to implement with Table Triggers)
+--Load Bronze table with sample data
+INSERT INTO main.d_bronze.customer_bronze VALUES
+  ('C001', 'Alice', 'alice@example.com',  true,  current_timestamp()),
+  ('C002', 'Bob',   'bob@example.com',    true,  current_timestamp()),
+  ('C003', 'Carol', 'carol@example.com',  true,  current_timestamp());
 
-OUTCOME: The data is available in Unity Catalog
+--Create Silver / ODS table
+CREATE SCHEMA IF NOT EXISTS main.d_silver;
 
-OUTCOME: It can handle append(upserts) only data
+CREATE TABLE IF NOT EXISTS main.d_silver.ods_customer (
+  customer_id       STRING,
+  customer_name     STRING,
+  email_address     STRING,
+  is_active         BOOLEAN,
+  record_timestamp  TIMESTAMP,
+  loaded_at_utc     TIMESTAMP,
+  modified_at_utc   TIMESTAMP,
+  _etl_batch_id     STRING
+)
+USING DELTA;
 
-OUTCOME: Table and Column Names in Snake Case (go with D_BRONZE)
-
-Acceptance Criteria
 
 
-GIVEN: We are able to simulate changes only data into the EDP
+--Generic CDF merge notebook (PySpark)
+--Cell 1 – Parameters:
+dbutils.widgets.text("bronze_table", "main.d_bronze.customer_bronze")
+dbutils.widgets.text("ods_table",    "main.d_silver.ods_customer")
+dbutils.widgets.text("key_columns",  "customer_id")  # comma-separated
+dbutils.widgets.text("data_columns", "customer_name,email_address,is_active,record_timestamp")
 
-WHEN: Data has been appended to the Bronze table
-THEN: The ODS job fires off
-AND THEN: The table is only showing active records
-AND THEN: The table captures when the data was loaded to the table
-AND THEN: The table captures when the data was modified in the table
 
- 
+--Cell 2 – Read params & setup:
+from delta.tables import DeltaTable
+from pyspark.sql.functions import current_timestamp, lit
+import datetime as dt
 
-NOTE: Table triggers exist and could be explored
-NOTE: A way to test things could be to utilize a simple insert statement.  this could also be used to simulate the simulator.
-NOTE: This will probably have some hard coding
+bronze_table = dbutils.widgets.get("bronze_table")
+ods_table    = dbutils.widgets.get("ods_table")
+key_cols     = [c.strip() for c in dbutils.widgets.get("key_columns").split(",") if c.strip()]
+data_cols    = [c.strip() for c in dbutils.widgets.get("data_columns").split(",") if c.strip()]
+
+batch_id = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+print(f"Bronze: {bronze_table}")
+print(f"ODS   : {ods_table}")
+print(f"Keys  : {key_cols}")
+print(f"Data  : {data_cols}")
+
+--Cell 3 – Read CDF changes from Bronze:
+# NOTE: Using startingVersion = 0 for simplicity.
+# In production, track last processed version in a status table.
+cdf_query = f"""
+  SELECT *
+  FROM table_changes('{bronze_table}', 0)
+  WHERE _change_type IN ('insert', 'update_postimage')
+"""
+df_changes = spark.sql(cdf_query)  # table_changes is the CDF function.[web:64]
+
+if df_changes.rdd.isEmpty():
+    print("No changes to process.")
+    dbutils.notebook.exit("NO_CHANGES")
+
+
+--Cell 4 – Prepare source with audit columns:
+# Drop CDF metadata not needed in ODS, add audit fields
+df_source = (df_changes
+             .drop("_change_type", "_commit_version", "_commit_timestamp", "_commit_user", "_confidence_level")
+             .withColumn("loaded_at_utc",   current_timestamp())
+             .withColumn("modified_at_utc", current_timestamp())
+             .withColumn("_etl_batch_id",   lit(batch_id)))
+
+--Cell 5 – Build dynamic MERGE and execute:
+
+delta_ods = DeltaTable.forName(spark, ods_table)
+
+# Join condition
+join_expr = " AND ".join([f"t.{c} = s.{c}" for c in key_cols])
+
+# Columns for update/insert
+audit_cols = ["loaded_at_utc", "modified_at_utc", "_etl_batch_id"]
+update_cols = data_cols + ["modified_at_utc", "_etl_batch_id"]
+insert_cols = key_cols + data_cols + audit_cols
+
+update_set = {col: f"s.{col}" for col in update_cols}
+insert_vals = {col: f"s.{col}" for col in insert_cols}
+
+(
+    delta_ods.alias("t")
+    .merge(df_source.alias("s"), join_expr)
+    .whenMatchedUpdate(set=update_set)
+    .whenNotMatchedInsert(values=insert_vals)
+    .execute()
+)
+
+print(f"MERGE complete for batch {batch_id}")
+
+
+
+-- test queries
+SELECT * FROM main.d_silver.ods_customer ORDER BY customer_id;
+
+
+-- Update existing customer
+UPDATE main.d_bronze.customer_bronze
+SET email_address = 'alice+vip@example.com'
+WHERE customer_id = 'C001';
+
+-- Insert new customer
+INSERT INTO main.d_bronze.customer_bronze VALUES
+  ('C004', 'Dave', 'dave@example.com', true, current_timestamp());
+
+
+SELECT customer_id, customer_name, email_address, is_active,
+       loaded_at_utc, modified_at_utc, _etl_batch_id
+FROM main.d_silver.ods_customer
+ORDER BY customer_id;
+
+
+

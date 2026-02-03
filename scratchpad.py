@@ -139,34 +139,42 @@ df_latest = (
 # df_latest has one “latest” row per customer_id in this batch
 print(f"[INFO] Latest-per-key rows in batch: {df_latest.count()}")
 Cell 6 – Split NEW vs CHANGED vs UNCHANGED
-We interpret “change” as any meaningful attribute difference vs current SCD2 active row.
 # Read current dimension (only current rows)
 dim_current = spark.table(dim_table).filter(col("is_current") == True)
 
 # Join latest incoming with current dim to detect changes
-join_expr = " AND ".join([f"d.{k} = s.{k}" for k in key_cols])
+join_cond = [col(f"s.{k}") == col(f"d.{k}") for k in key_cols]
 
 df_join = (
     df_latest.alias("s")
-    .join(dim_current.alias("d"), on=[col(f"s.{k}") == col(f"d.{k}") for k in key_cols], how="left")
+    .join(dim_current.alias("d"), on=join_cond, how="left")
 )
 
-# Columns to compare for change
+# Columns to compare for change (SCD attributes)
 compare_cols = data_cols
 
-# Rows with NO current dim row → brand new customers
-df_new = df_join.filter(col("d.customer_id").isNull()).select("s.*")
+# Helper: build "no current row" condition generically
+no_current_cond = None
+for k in key_cols:
+    cond = col(f"d.{k}").isNull()
+    no_current_cond = cond if no_current_cond is None else (no_current_cond & cond)
 
-# Rows with existing current dim row AND any changed data column
+# NEW rows: no current dim row for that business key
+df_new = df_join.filter(no_current_cond).select("s.*")
+
+# CHANGED rows: there is a current row AND at least one attribute changed
 change_cond = None
 for c in compare_cols:
     cond = (col(f"s.{c}") != col(f"d.{c}")) | (col(f"s.{c}").isNull() != col(f"d.{c}").isNull())
     change_cond = cond if change_cond is None else (change_cond | cond)
 
-df_changed = df_join.filter(col("d.customer_id").isNotNull() & change_cond).select("s.*")
+has_current_cond = ~no_current_cond  # opposite of "no current row"
+
+df_changed = df_join.filter(has_current_cond & change_cond).select("s.*")
 
 print(f"[INFO] New customers     : {df_new.count()}")
 print(f"[INFO] Changed customers : {df_changed.count()}")
+
 
 Cell 7 – Prepare rows to INSERT for SCD2
 # For SCD2:

@@ -1,313 +1,283 @@
-# Silver ODS Merge Approaches - Comparison Matrix
-
-## 4 Approaches for Bronze → ODS Merge
-
-### A. Status Management Table (Watermark Tracking)
-
-**Pros:**
-- Explicit control over watermark
-- Audit trail of all processing
-- Can handle multiple sources
-- Easy to restart from checkpoint
-- Simple to understand
-
-**Cons:**
-- Extra table to maintain
-- Manual watermark updates needed
-- Can miss data if not careful
-- Requires status table locks
-
-**Performance:** 5-10x faster (vs full scan)
-**Complexity:** Medium
-**Cost:** $115/month (vs $600 full scan)
-**Best For:** Multi-source systems, audit-heavy scenarios
-
-**Code Snippet:**
-```python
-max_version = spark.sql("SELECT MAX(processed_version) FROM status_table").collect()[0][0]
-df = spark.sql(f"SELECT * FROM bronze WHERE version > {max_version}")
-# MERGE df into ODS
-# Update status_table with new version
-```
-
----
-
-### B. Change Data Feed (CDF) - RECOMMENDED ⭐
-
-**Pros:**
-- Native Delta Lake feature
-- Reads ONLY changes (insert/update/delete)
-- Automatic change tracking
-- Tracks _commit_version precisely
-- Zero manual overhead
-- Sub-second latency possible
-
-**Cons:**
-- Requires CDF enablement (1 SQL line)
-- Not available pre-Delta 1.2
-- Slightly more storage (5-10%)
-
-**Performance:** 10-100x faster (vs full scan)
-**Complexity:** Low
-**Cost:** $60/month (vs $600 full scan)
-**Best For:** Real-time event-driven triggers, preferred solution
-
-**Code Snippet:**
-```python
-df_changes = spark.sql("""
-    SELECT * FROM table_changes('bronze_table', 0)
-    WHERE _change_type IN ('insert', 'update_postimage')
-""")
-# MERGE df_changes into ODS
-```
-
----
-
-### C. Watermark from Silver ODS (Timestamp-based)
-
-**Pros:**
-- No extra table needed
-- Simple to implement
-- Works everywhere
-- Uses existing ODS data
-
-**Cons:**
-- Timestamp filtering (can be imprecise)
-- Requires clock synchronization
-- Can duplicate records with same timestamp
-- Clock skew issues
-
-**Performance:** 5-10x faster (vs full scan)
-**Complexity:** Low
-**Cost:** $115/month (vs $600 full scan)
-**Best For:** Simple ETL, timestamp-reliable sources
-
-**Code Snippet:**
-```python
-max_ts = spark.sql("SELECT MAX(modified_at_utc) FROM ods").collect()[0][0]
-df = spark.sql(f"SELECT * FROM bronze WHERE extracted_at >= '{max_ts}'")
-# MERGE df into ODS
-```
-
----
-
-### D. Full Merge Every Time
-
-**Pros:**
-- Simplest to implement
-- No watermark logic needed
-- No assumptions about data
-- Works for small tables
-
-**Cons:**
-- Scans entire table every time
-- 99% data waste
-- Very slow (30+ seconds)
-- Very expensive ($600+/month)
-- Not scalable
-
-**Performance:** Baseline (no optimization)
-**Complexity:** Trivial
-**Cost:** $600/month
-**Best For:** Only for <100K rows or one-time loads
-
-**Code Snippet:**
-```python
-df = spark.sql("SELECT * FROM bronze")
-# MERGE df into ODS
-```
-
----
-
-## Comparison Matrix
-
-| Aspect | A: Status Mgmt | B: CDF ⭐ | C: Timestamp | D: Full Merge |
-|--------|---|---|---|---|
-| **Setup Time** | 10 min | 1 min | 2 min | 1 min |
-| **Complexity** | Medium | Low | Low | Trivial |
-| **Speed** | 5-10x | 10-100x | 5-10x | 1x (baseline) |
-| **Cost/Month** | $115 | $60 | $115 | $600 |
-| **Watermark** | Manual table | Automatic | Timestamp | N/A |
-| **Maintenance** | High | Low | Low | None |
-| **Audit Trail** | Yes | Yes | No | No |
-| **Production Ready** | Yes | Yes | Yes | No |
-| **Scalability** | Good | Excellent | Good | Poor |
-| **Clock Skew Risk** | No | No | Yes | No |
-| **Works at Scale** | Yes | Yes | Maybe | No |
-
----
-
-## Recommendation by Scenario
-
-| Scenario | Best Approach | Why |
-|----------|---|---|
-| **Real-time triggers (1-5 min)** | B: CDF | 10-100x faster, native, no overhead |
-| **Multi-source ETL** | A: Status Mgmt | Explicit control, audit trail |
-| **Simple daily batch** | C: Timestamp | Works, low complexity |
-| **Large tables (100M+)** | B: CDF | Only viable option for scale |
-| **Audit-heavy org** | A: Status Mgmt | Explicit watermark tracking |
-| **Prototype/POC** | D: Full Merge | OK for <100K rows |
-
----
-
-## Decision Tree
-
-```
-Start
-  ↓
-Is it production? → NO → Use D: Full Merge (if <100K rows)
-  ↓ YES
-Has audit requirements? → YES → Use A: Status Mgmt
-  ↓ NO
-Real-time triggers? → YES → Use B: CDF ⭐ (RECOMMENDED)
-  ↓ NO
-Timestamp-reliable data? → YES → Use C: Timestamp
-  ↓ NO
-→ Use B: CDF (default safe choice)
-```
-
----
-
-## Performance Metrics (5M row Bronze table)
-
-| Approach | Per Trigger | Per Day | Per Month | Rows Scanned |
-|----------|---|---|---|---|
-| **A: Status Mgmt** | 3-5 sec | 72 min | $115 | 100 |
-| **B: CDF** | 3 sec | 72 min | $60 | 100 |
-| **C: Timestamp** | 3-5 sec | 72 min | $115 | 100 |
-| **D: Full Merge** | 30 sec | 720 min | $600 | 5M |
-
----
-
-## Implementation Effort
-
-| Approach | Dev Time | Testing | Deployment | Maintenance |
-|----------|---|---|---|---|
-| A | 3 hours | 2 hours | 1 hour | Daily |
-| B | 30 min | 30 min | 30 min | None |
-| C | 30 min | 30 min | 30 min | Low |
-| D | 10 min | 10 min | 10 min | None |
-
----
-
-## Risk Analysis
-
-| Approach | Data Loss | Data Duplication | Clock Issues | Scalability |
-|----------|---|---|---|---|
-| A | Low | Medium | No | Excellent |
-| B | Very Low | None | No | Excellent |
-| C | Low | Medium | **YES** | Good |
-| D | None | None | No | Poor |
-
----
-
-## Recommendation: Use B (CDF)
-
-**Why:**
-1. ✅ 10-100x faster
-2. ✅ 90% cost savings
-3. ✅ Native Delta feature
-4. ✅ Zero data waste
-5. ✅ Scales infinitely
-6. ✅ Real-time capable
-7. ✅ Production-grade
-8. ✅ Low maintenance
-
-**One-time setup:**
-```sql
-ALTER TABLE main.d_bronze.edp_customer_bronze
-SET TBLPROPERTIES (delta.enableChangeDataFeed = true);
-```
-
-**Then use:**
-```python
-df_changes = spark.sql("""
-    SELECT * FROM table_changes('bronze_table', 0)
-    WHERE _change_type IN ('insert', 'update_postimage')
-""")
-# MERGE into ODS
-```
-
----
-
-## Q&A for Agile Team
-
-**Q: Which is fastest?**
-A: CDF (Approach B) - 10-100x faster than full merge
-
-**Q: Which is cheapest?**
-A: CDF (Approach B) - $60/month vs $600 for full merge
-
-**Q: Which is simplest?**
-A: Full Merge (Approach D) - but not production-ready for large tables
-
-**Q: Which needs most maintenance?**
-A: Status Management (Approach A) - requires watermark updates
-
-**Q: Which is most reliable?**
-A: CDF (Approach B) - native Delta Lake, automatic tracking
-
-**Q: Can we scale to 100M+ rows?**
-A: Only CDF (Approach B) - others will bottleneck
-
-**Q: What if CDF not available?**
-A: Use Timestamp (Approach C) - but watch for clock skew
-
-**Q: Can we use Status Mgmt for multiple sources?**
-A: Yes - Approach A is best for multi-source scenarios
-
----
-
-## Vote Result
-
-| Approach | Best Choice | Reason |
-|----------|---|---|
-| **A: Status Mgmt** | ❌ | Use only for multi-source audit scenarios |
-| **B: CDF** | ✅✅✅ | **RECOMMENDED - Use this** |
-| **C: Timestamp** | ⚠️ | Backup if CDF unavailable |
-| **D: Full Merge** | ❌ | Only for POC/prototype with small tables |
-
----
-
-## Next Steps
-
-1. **Decision:** Recommend CDF (Approach B)
-2. **Action:** Enable CDF (1 SQL line)
-3. **Implementation:** Deploy CDF notebook
-4. **Timeline:** 2 hours to production
-5. **Result:** 10x faster, 90% cheaper
-
----
-
-## Summary Slide for Agile Team
-
-```
-APPROACHES FOR SILVER ODS MERGE
-
-A. Status Management Table
-   └─ Pros: Audit trail, explicit control
-   └─ Cons: Extra table, manual updates
-   └─ Speed: 5-10x | Cost: $115/mo | Use: Multi-source
-
-B. Change Data Feed ⭐ RECOMMENDED
-   └─ Pros: Native Delta, automatic, 10-100x faster
-   └─ Cons: Requires enablement (1 line SQL)
-   └─ Speed: 10-100x | Cost: $60/mo | Use: Production
-
-C. Timestamp Watermark
-   └─ Pros: Simple, no extra table
-   └─ Cons: Clock skew risk, imprecise
-   └─ Speed: 5-10x | Cost: $115/mo | Use: Simple ETL
-
-D. Full Merge Every Time
-   └─ Pros: Simplest
-   └─ Cons: 99% waste, slow, expensive
-   └─ Speed: 1x | Cost: $600/mo | Use: POC only
-
-RECOMMENDATION: Use B (CDF)
-- Setup: 1 minute
-- Performance: 10-100x faster
-- Cost: $60/month (vs $600)
-- Maintenance: None
-- Status: Production-ready
-```
+--0. One-time SQL setup (run once)
+
+-- Schemas
+CREATE SCHEMA IF NOT EXISTS main.d_bronze;
+CREATE SCHEMA IF NOT EXISTS main.d_silver;
+CREATE SCHEMA IF NOT EXISTS main.control;
+
+-- Status table for CDF version tracking
+CREATE TABLE IF NOT EXISTS main.control.cdf_status_scd2 (
+  source_table             STRING,
+  last_processed_version   BIGINT,
+  last_processed_timestamp TIMESTAMP,
+  last_batch_id            STRING,
+  versions_processed       BIGINT,
+  PRIMARY KEY (source_table)
+) USING DELTA;
+
+-- Bronze (append-only) with CDF enabled
+CREATE TABLE IF NOT EXISTS main.d_bronze.customer_bronze (
+  customer_id       STRING,
+  customer_name     STRING,
+  email_address     STRING,
+  record_timestamp  TIMESTAMP,
+  loaded_at_utc     TIMESTAMP
+)
+USING DELTA
+TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+-- Silver Dimension (SCD2) – history table
+CREATE TABLE IF NOT EXISTS main.d_silver.dim_customer_scd2 (
+  customer_sk          BIGINT GENERATED ALWAYS AS IDENTITY,
+  customer_id          STRING,
+  customer_name        STRING,
+  email_address        STRING,
+  record_timestamp     TIMESTAMP,
+  bronze_loaded_at_utc TIMESTAMP,
+  effective_start_utc  TIMESTAMP,
+  effective_end_utc    TIMESTAMP,
+  is_current           BOOLEAN
+)
+USING DELTA;
+
+
+
+--Optional: clear and seed Bronze for testing:
+TRUNCATE TABLE main.d_bronze.customer_bronze;
+TRUNCATE TABLE main.d_silver.dim_customer_scd2;
+DELETE FROM main.control.cdf_status_scd2 WHERE source_table = 'main.d_bronze.customer_bronze';
+
+INSERT INTO main.d_bronze.customer_bronze VALUES
+  ('C001','Alice','alice@example.com',  current_timestamp(), current_timestamp()),
+  ('C002','Bob',  'bob@example.com',    current_timestamp(), current_timestamp()),
+  ('C003','Carol','carol@example.com',  current_timestamp(), current_timestamp());
+
+
+
+-- Notebook: CDF → SCD2 merge
+Cell 1 – Parameters
+dbutils.widgets.text("bronze_table",  "main.d_bronze.customer_bronze")
+dbutils.widgets.text("dim_table",     "main.d_silver.dim_customer_scd2")
+dbutils.widgets.text("status_table",  "main.control.cdf_status_scd2")
+dbutils.widgets.text("key_columns",   "customer_id")
+dbutils.widgets.text("data_columns",  "customer_name,email_address,record_timestamp")
+Cell 2 – Setup
+from delta.tables import DeltaTable
+from pyspark.sql.functions import (
+    current_timestamp, col, max as spark_max, row_number
+)
+from pyspark.sql.window import Window
+import datetime as dt
+
+bronze_table = dbutils.widgets.get("bronze_table")
+dim_table    = dbutils.widgets.get("dim_table")
+status_table = dbutils.widgets.get("status_table")
+
+key_cols  = [c.strip() for c in dbutils.widgets.get("key_columns").split(",") if c.strip()]
+data_cols = [c.strip() for c in dbutils.widgets.get("data_columns").split(",") if c.strip()]
+
+batch_id = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+print(f"[CONFIG] Bronze : {bronze_table}")
+print(f"[CONFIG] Dim    : {dim_table}")
+print(f"[CONFIG] Status : {status_table}")
+print(f"[CONFIG] Keys   : {key_cols}")
+print(f"[CONFIG] Data   : {data_cols}")
+print(f"[CONFIG] Batch  : {batch_id}")
+Cell 3 – Get last processed CDF version
+source_id = bronze_table  # identifier for status table
+
+last_version_query = f"""
+    SELECT last_processed_version
+    FROM {status_table}
+    WHERE source_table = '{source_id}'
+"""
+
+try:
+    rows = spark.sql(last_version_query).collect()
+    if rows and rows[0]["last_processed_version"] is not None:
+        start_version = rows[0]["last_processed_version"] + 1
+    else:
+        start_version = 0
+except Exception:
+    start_version = 0
+
+print(f"[INFO] Starting from CDF version: {start_version}")
+
+Cell 4 – Read CDF changes (append-only → inserts only)
+cdf_query = f"""
+  SELECT *, _commit_version
+  FROM table_changes('{bronze_table}', {start_version})
+  WHERE _change_type = 'insert'
+"""
+
+df_changes = spark.sql(cdf_query)
+
+if df_changes.limit(1).count() == 0:
+    print(f"[INFO] No new changes since version {start_version}")
+    dbutils.notebook.exit("NO_CHANGES")
+
+changes_count = df_changes.count()
+max_version   = df_changes.agg(spark_max("_commit_version")).collect()[0][0]
+versions_proc = max_version - start_version + 1
+
+print(f"[INFO] New inserts           : {changes_count}")
+print(f"[INFO] CDF version range     : {start_version} → {max_version}")
+print(f"[INFO] CDF versions processed: {versions_proc}")
+
+Cell 5 – Prepare “latest per key” batch snapshot
+For SCD2 we need to compare latest incoming state per key to the current active dim row.
+w = Window.partitionBy(*key_cols).orderBy(col("_commit_version").desc())
+
+df_latest = (
+    df_changes
+    .withColumn("rn", row_number().over(w))
+    .filter(col("rn") == 1)
+    .drop("rn")
+)
+
+# df_latest has one “latest” row per customer_id in this batch
+print(f"[INFO] Latest-per-key rows in batch: {df_latest.count()}")
+Cell 6 – Split NEW vs CHANGED vs UNCHANGED
+We interpret “change” as any meaningful attribute difference vs current SCD2 active row.
+# Read current dimension (only current rows)
+dim_current = spark.table(dim_table).filter(col("is_current") == True)
+
+# Join latest incoming with current dim to detect changes
+join_expr = " AND ".join([f"d.{k} = s.{k}" for k in key_cols])
+
+df_join = (
+    df_latest.alias("s")
+    .join(dim_current.alias("d"), on=[col(f"s.{k}") == col(f"d.{k}") for k in key_cols], how="left")
+)
+
+# Columns to compare for change
+compare_cols = data_cols
+
+# Rows with NO current dim row → brand new customers
+df_new = df_join.filter(col("d.customer_id").isNull()).select("s.*")
+
+# Rows with existing current dim row AND any changed data column
+change_cond = None
+for c in compare_cols:
+    cond = (col(f"s.{c}") != col(f"d.{c}")) | (col(f"s.{c}").isNull() != col(f"d.{c}").isNull())
+    change_cond = cond if change_cond is None else (change_cond | cond)
+
+df_changed = df_join.filter(col("d.customer_id").isNotNull() & change_cond).select("s.*")
+
+print(f"[INFO] New customers     : {df_new.count()}")
+print(f"[INFO] Changed customers : {df_changed.count()}")
+
+Cell 7 – Prepare rows to INSERT for SCD2
+# For SCD2:
+
+# For new keys:
+
+# Insert a new row with is_current = true, effective_start_utc = now, effective_end_utc = null.
+
+# For changed keys:
+
+# End-date old row (is_current = false, effective_end_utc = now).
+
+# Insert a new row with is_current = true, new attributes, new start date.
+
+# First, build the new rows to insert:
+
+                               from pyspark.sql.functions import lit
+
+now_ts = current_timestamp()
+
+# NEW keys → new SCD2 rows
+df_new_scd2 = (
+    df_new
+    .withColumnRenamed("loaded_at_utc", "bronze_loaded_at_utc")
+    .withColumn("effective_start_utc", now_ts)
+    .withColumn("effective_end_utc",   lit(None).cast("timestamp"))
+    .withColumn("is_current",          lit(True))
+)
+
+# CHANGED keys → new SCD2 rows (new version)
+df_changed_scd2 = (
+    df_changed
+    .withColumnRenamed("loaded_at_utc", "bronze_loaded_at_utc")
+    .withColumn("effective_start_utc", now_ts)
+    .withColumn("effective_end_utc",   lit(None).cast("timestamp"))
+    .withColumn("is_current",          lit(True))
+)
+
+df_to_insert = df_new_scd2.unionByName(df_changed_scd2)
+
+print(f"[INFO] Total new SCD2 rows to insert: {df_to_insert.count()}")
+
+Cell 8 – End-date existing current rows for changed keys
+
+delta_dim = DeltaTable.forName(spark, dim_table)
+
+if df_changed.limit(1).count() > 0:
+    # Keys that changed
+    changed_keys = df_changed.select(*key_cols).distinct()
+    end_join = " AND ".join([f"t.{k} = s.{k}" for k in key_cols])
+
+    (
+        delta_dim.alias("t")
+        .merge(
+            changed_keys.alias("s"),
+            end_join
+        )
+        .whenMatchedUpdate(
+            condition="t.is_current = true",
+            set={
+                "is_current": "false",
+                "effective_end_utc": "current_timestamp()"
+            }
+        )
+        .execute()
+    )
+    print(f"[INFO] End-dated current rows for changed keys: {changed_keys.count()}")
+else:
+    print("[INFO] No changed keys → no end-dates applied")
+Cell 9 – Insert new SCD2 rows
+if df_to_insert.limit(1).count() > 0:
+    (
+        df_to_insert
+        .select(
+            *key_cols,
+            *data_cols,
+            "bronze_loaded_at_utc",
+            "effective_start_utc",
+            "effective_end_utc",
+            "is_current"
+        )
+        .write
+        .format("delta")
+        .mode("append")
+        .saveAsTable(dim_table)
+    )
+    print(f"[INFO] Inserted {df_to_insert.count()} new SCD2 rows")
+else:
+    print("[INFO] No new SCD2 rows to insert")
+Cell 10 – Update CDF status
+status_merge = f"""
+    MERGE INTO {status_table} t
+    USING (
+        SELECT
+            '{source_id}'         AS source_table,
+            {max_version}         AS last_processed_version,
+            current_timestamp()   AS last_processed_timestamp,
+            '{batch_id}'          AS last_batch_id,
+            {versions_proc}       AS versions_processed
+    ) s
+    ON t.source_table = s.source_table
+    WHEN MATCHED THEN UPDATE SET
+        t.last_processed_version   = s.last_processed_version,
+        t.last_processed_timestamp = s.last_processed_timestamp,
+        t.last_batch_id            = s.last_batch_id,
+        t.versions_processed       = s.versions_processed
+    WHEN NOT MATCHED THEN INSERT *
+"""
+
+spark.sql(status_merge)
+print(f"[INFO] Status updated: {start_version} → {max_version}")
+dbutils.notebook.exit("OK")
+
+

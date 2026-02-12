@@ -1,89 +1,67 @@
-Cell 2 – Helper: call merge notebook + validation
-def run_merge_and_validate(test_name: str):
-    print(f"\n================ {test_name} ================")
-    
-    # 1. Trigger merge notebook
-    result = dbutils.notebook.run(
-        "/Shared/ods_cdf_merge",
-        timeout_seconds=600,
-        arguments={
-            "bronze_table":  "main.d_bronze.customer_bronze",
-            "ods_table":     "main.d_silver.ods_customer",
-            "status_table":  "main.control.cdf_status",
-            "key_columns":   "customer_id",
-            "data_columns":  "customer_name,email_address,record_timestamp"
-        }
-    )
-    print(f"[MERGE NOTEBOOK RESULT] {result}")
-    
-    # 2. Validation queries + prints
-    
-    print("\n[VALIDATION] ODS contents:")
-    df_ods = spark.sql("""
-        SELECT customer_id, customer_name, email_address,
-               record_timestamp, bronze_loaded_at_utc,
-               loaded_at_utc, modified_at_utc
-        FROM main.d_silver.ods_customer
-        ORDER BY customer_id
-    """)
-    df_ods.show(truncate=False)
-    
-    print("\n[VALIDATION] ODS row count:")
-    cnt = spark.sql("SELECT COUNT(*) AS total FROM main.d_silver.ods_customer").collect()[0]["total"]
-    print(f"ODS total rows: {cnt}")
-    
-    print("\n[VALIDATION] CDF status table:")
-    spark.sql("""
-        SELECT source_table, last_processed_version, versions_processed, last_processed_timestamp
-        FROM main.control.cdf_status
-        WHERE source_table = 'main.d_bronze.customer_bronze'
-    """).show(truncate=False)
-    
-    print("================================================\n")
-
-Cell 3 – Test 1: Initial load
-
-print(">>> TEST 1: Initial load from Bronze to ODS (C001–C003)")
-run_merge_and_validate("TEST 1 – Initial load")
-
-Cell 4 – Test 2: Inserts
-
-print(">>> TEST 2: Insert new customers C004, C005 in Bronze")
-
-spark.sql("""
-INSERT INTO main.d_bronze.customer_bronze VALUES
-  ('C004','Dave','dave@example.com', current_timestamp(), current_timestamp()),
-  ('C005','Eve','eve@example.com',   current_timestamp(), current_timestamp())
-""")
-
-run_merge_and_validate("TEST 2 – New inserts C004,C005")
-
-Cell 5 – Test 3: “Updates” via new rows
-print(">>> TEST 3: Update C001, C002 in Bronze via new rows")
-
-spark.sql("""
-INSERT INTO main.d_bronze.customer_bronze VALUES
-  ('C001','Alice Smith','alice.smith@example.com', current_timestamp(), current_timestamp()),
-  ('C002','Bob Jr','bobjr@example.com',            current_timestamp(), current_timestamp())
-""")
-
-run_merge_and_validate("TEST 3 – Updates for C001,C002")
+confluent kafka topic create your-outbound-topic --partitions 6 --replication-factor 3 --config retention.ms=604800000 --config min.insync.replicas=2 --config cleanup.policy=delete --config compression.type=snappy --config max.message.bytes=1048576 --config segment.ms=86400000
 
 
-Cell 6 – Test 4: Mixed new + updated
-print(">>> TEST 4: Update C003 and insert C006 in Bronze")
+# Replace values as needed:
+# <topic-name>: Your topic name
+# partitions: 3-6 for low volume, 10+ for high volume
+# retention.ms: 604800000 = 7 days, 2592000000 = 30 days
 
-spark.sql("""
-INSERT INTO main.d_bronze.customer_bronze VALUES
-  ('C003','Carol Senior','carol.sr@example.com', current_timestamp(), current_timestamp()),  -- update
-  ('C006','Frank','frank@example.com',           current_timestamp(), current_timestamp())   -- new
-""")
+confluent kafka topic create <topic-name> --partitions 6 --replication-factor 3 --config retention.ms=604800000 --config min.insync.replicas=2 --config cleanup.policy=delete --config compression.type=snappy --config max.message.bytes=1048576 --config segment.ms=86400000
 
-run_merge_and_validate("TEST 4 – Update C003, Insert C006")
+## Configuration Breakdown
 
+**Partitions:**
+- Start with (expected throughput / target throughput per partition)
+- Consider: 3-6 partitions for low volume, 10+ for high volume
+- Remember: You can increase but not easily decrease
 
+**Replication Factor:**
+- **Production standard: 3** (provides fault tolerance)
+- Protects against broker failures
 
+**min.insync.replicas:**
+- **Recommended: 2** (with replication factor 3)
+- Ensures data is written to at least 2 replicas before acknowledging
+- Critical for data durability
 
+**Retention:**
+- `retention.ms`: How long to keep messages (7 days = 604800000 ms)
+- `retention.bytes`: Max size per partition (optional)
 
+**Cleanup Policy:**
+- `delete`: Remove old messages (most common)
+- `compact`: Keep only latest value per key (for state topics)
 
+**Compression:**
+- `snappy` or `lz4`: Good balance of compression and CPU
+- `gzip`: Better compression, more CPU intensive
 
+**Message Size:**
+- `max.message.bytes`: Default 1MB, increase if needed
+- Align with producer settings
+
+**Segment Settings:**
+- `segment.ms`: 1 day (86400000) is common for production
+
+## Before Creating - Ask These Questions:
+
+1. **What's your expected message throughput?** (messages/second)
+2. **What's your data retention requirement?** (compliance, business needs)
+3. **How critical is data loss prevention?** (determines replication strategy)
+4. **What's your average message size?**
+5. **Do you need ordering guarantees?** (affects partition strategy)
+6. **Are you using message keys?** (for compaction or ordering)
+
+## Producer/Consumer Considerations
+
+Your topic config should align with producer settings:
+- Producer `acks=all` with `min.insync.replicas=2` for durability
+- Producer `enable.idempotence=true` to prevent duplicates
+- Consumer groups for parallel processing
+
+## Monitoring After Creation
+
+Set up alerts for:
+- Under-replicated partitions
+- Lag in consumer groups
+- Disk usage approaching retention limits

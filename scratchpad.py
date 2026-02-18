@@ -1,291 +1,306 @@
---0. One-time SQL setup (run once)
+# Databricks notebook source
+# MAGIC %md
+# MAGIC ## BRONZE-TO-ODS MERGE NOTEBOOK
+# MAGIC
 
--- Schemas
-CREATE SCHEMA IF NOT EXISTS main.d_bronze;
-CREATE SCHEMA IF NOT EXISTS main.d_silver;
-CREATE SCHEMA IF NOT EXISTS main.control;
+# COMMAND ----------
 
--- Status table for CDF version tracking
-CREATE TABLE IF NOT EXISTS main.control.cdf_status_scd2 (
-  source_table             STRING,
-  last_processed_version   BIGINT,
-  last_processed_timestamp TIMESTAMP,
-  last_batch_id            STRING,
-  versions_processed       BIGINT,
-  PRIMARY KEY (source_table)
-) USING DELTA;
+# MAGIC %md
+# MAGIC ### Parameters
 
--- Bronze (append-only) with CDF enabled
-CREATE TABLE IF NOT EXISTS main.d_bronze.customer_bronze (
-  customer_id       STRING,
-  customer_name     STRING,
-  email_address     STRING,
-  record_timestamp  TIMESTAMP,
-  loaded_at_utc     TIMESTAMP
-)
-USING DELTA
-TBLPROPERTIES (delta.enableChangeDataFeed = true);
+# COMMAND ----------
 
--- Silver Dimension (SCD2) – history table
-CREATE TABLE IF NOT EXISTS main.d_silver.dim_customer_scd2 (
-  customer_sk          BIGINT GENERATED ALWAYS AS IDENTITY,
-  customer_id          STRING,
-  customer_name        STRING,
-  email_address        STRING,
-  record_timestamp     TIMESTAMP,
-  bronze_loaded_at_utc TIMESTAMP,
-  effective_start_utc  TIMESTAMP,
-  effective_end_utc    TIMESTAMP,
-  is_current           BOOLEAN
-)
-USING DELTA;
+# DBTITLE 1,Cell 3
+dbutils.widgets.removeAll()
+dbutils.widgets.text("bronze_catalog", "d_bronze")
+dbutils.widgets.text("silver_catalog",    "d_silver_ods")
+dbutils.widgets.text("schema_name", "temp")
+dbutils.widgets.text("table_name", "customer_test")
+dbutils.widgets.text("key_columns",  "customer_id")  # comma-separated
+dbutils.widgets.text("data_columns", "customer_name, email_address") # comma-separated
 
+# COMMAND ----------
 
+# MAGIC %md
+# MAGIC ###Read params & setup
 
---Optional: clear and seed Bronze for testing:
-TRUNCATE TABLE main.d_bronze.customer_bronze;
-TRUNCATE TABLE main.d_silver.dim_customer_scd2;
-DELETE FROM main.control.cdf_status_scd2 WHERE source_table = 'main.d_bronze.customer_bronze';
+# COMMAND ----------
 
-INSERT INTO main.d_bronze.customer_bronze VALUES
-  ('C001','Alice','alice@example.com',  current_timestamp(), current_timestamp()),
-  ('C002','Bob',  'bob@example.com',    current_timestamp(), current_timestamp()),
-  ('C003','Carol','carol@example.com',  current_timestamp(), current_timestamp());
-
-
-
--- Notebook: CDF → SCD2 merge
-Cell 1 – Parameters
-dbutils.widgets.text("bronze_table",  "main.d_bronze.customer_bronze")
-dbutils.widgets.text("dim_table",     "main.d_silver.dim_customer_scd2")
-dbutils.widgets.text("status_table",  "main.control.cdf_status_scd2")
-dbutils.widgets.text("key_columns",   "customer_id")
-dbutils.widgets.text("data_columns",  "customer_name,email_address,record_timestamp")
-Cell 2 – Setup
+# DBTITLE 1,Cell 5
 from delta.tables import DeltaTable
-from pyspark.sql.functions import (
-    current_timestamp, col, max as spark_max, row_number
-)
+from pyspark.sql.functions import current_timestamp, lit, col, max as spark_max, row_number
 from pyspark.sql.window import Window
 import datetime as dt
 
-bronze_table = dbutils.widgets.get("bronze_table")
-dim_table    = dbutils.widgets.get("dim_table")
-status_table = dbutils.widgets.get("status_table")
+bronze_catalog = dbutils.widgets.get("bronze_catalog")
+silver_catalog = dbutils.widgets.get("silver_catalog")
+schema_name = dbutils.widgets.get("schema_name")
+table_name    = dbutils.widgets.get("table_name")
+key_cols     = [c.strip() for c in dbutils.widgets.get("key_columns").split(",") if c.strip()]
+data_cols    = [c.strip() for c in dbutils.widgets.get("data_columns").split(",") if c.strip()]
 
-key_cols  = [c.strip() for c in dbutils.widgets.get("key_columns").split(",") if c.strip()]
-data_cols = [c.strip() for c in dbutils.widgets.get("data_columns").split(",") if c.strip()]
+print(f"Bronze Catalog: {bronze_catalog}")
+print(f"Silver Catalog: {silver_catalog}")
+print(f"Schema Name: {schema_name}")
+print(f"Table Name   : {table_name}")
+print(f"Keys  : {key_cols}")
+print(f"Data  : {data_cols}")
 
-batch_id = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+# COMMAND ----------
 
-print(f"[CONFIG] Bronze : {bronze_table}")
-print(f"[CONFIG] Dim    : {dim_table}")
-print(f"[CONFIG] Status : {status_table}")
-print(f"[CONFIG] Keys   : {key_cols}")
-print(f"[CONFIG] Data   : {data_cols}")
-print(f"[CONFIG] Batch  : {batch_id}")
-Cell 3 – Get last processed CDF version
-source_id = bronze_table  # identifier for status table
+# DBTITLE 1,Cell 6
+# MAGIC %md
+# MAGIC ###Get last processed CDF version from Delta history
 
-last_version_query = f"""
-    SELECT last_processed_version
-    FROM {status_table}
-    WHERE source_table = '{source_id}'
-"""
+# COMMAND ----------
+
+# DBTITLE 1,Cell 7
+# Read last processed version from target table's _bronze_version column
+target_table = f"{silver_catalog}.{schema_name}.{table_name}_hist"
 
 try:
-    rows = spark.sql(last_version_query).collect()
-    if rows and rows[0]["last_processed_version"] is not None:
-        start_version = rows[0]["last_processed_version"] + 1
+    # Query the max bronze version from the target table
+    max_version_query = f"""
+        SELECT MAX(_bronze_version) as last_version
+        FROM {target_table}
+    """
+    
+    result = spark.sql(max_version_query).collect()
+    
+    if result and result[0]["last_version"] is not None:
+        start_version = result[0]["last_version"] + 1
     else:
         start_version = 0
-except Exception:
+except Exception as e:
+    # Table doesn't exist yet
+    print(f"No history found (table may be new): {e}")
     start_version = 0
 
-print(f"[INFO] Starting from CDF version: {start_version}")
+print(f"Starting from CDF version: {start_version}")
 
-Cell 4 – Read CDF changes (append-only → inserts only)
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##Read CDF (Change Data Feed) changes from Bronze
+
+# COMMAND ----------
+
+# Read the changes from the bronze table
+
 cdf_query = f"""
   SELECT *, _commit_version
-  FROM table_changes('{bronze_table}', {start_version})
+  FROM table_changes('{bronze_catalog}.{schema_name}.{table_name}', {start_version})
   WHERE _change_type = 'insert'
 """
 
 df_changes = spark.sql(cdf_query)
 
-if df_changes.limit(1).count() == 0:
-    print(f"[INFO] No new changes since version {start_version}")
-    dbutils.notebook.exit("NO_CHANGES")
+print(f"CDF Query:\n{cdf_query}")
 
-changes_count = df_changes.count()
-max_version   = df_changes.agg(spark_max("_commit_version")).collect()[0][0]
-versions_proc = max_version - start_version + 1
+df_changes = spark.sql(cdf_query)  # table_changes is the CDF function.[web:64]
+print(f"Changes in CDF: Sample 10 records")
+display(df_changes,10)
 
-print(f"[INFO] New inserts           : {changes_count}")
-print(f"[INFO] CDF version range     : {start_version} → {max_version}")
-print(f"[INFO] CDF versions processed: {versions_proc}")
+if df_changes.isEmpty():
+    print("No changes to process.")
+    dbutils.notebook.exit("No changes in bronze layer to process")
 
-Cell 5 – Prepare “latest per key” batch snapshot
-For SCD2 we need to compare latest incoming state per key to the current active dim row.
-w = Window.partitionBy(*key_cols).orderBy(col("_commit_version").desc())
+changes_count   = df_changes.count()
+max_version     = df_changes.agg(spark_max("_commit_version")).collect()[0][0]
+versions_proc   = max_version - start_version + 1
 
-df_latest = (
+print(f"New inserts          : {changes_count}")
+print(f"CDF version range    : {start_version} → {max_version}")
+print(f"CDF versions processed: {versions_proc}")    
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell 10
+# MAGIC %md
+# MAGIC ###Prepare source and detect processing strategy
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell 11
+# For proper SCD2, deduplicate WITHIN each version only
+# This preserves intermediate changes across different versions
+w = Window.partitionBy(*key_cols, "_commit_version").orderBy(col("_commit_timestamp").desc())
+
+df_source = (
     df_changes
     .withColumn("rn", row_number().over(w))
-    .filter(col("rn") == 1)
-    .drop("rn")
+    .filter(col("rn") == 1)  # Keep one record per key per version
+    .drop("rn", "_change_type")
 )
 
-# df_latest has one “latest” row per customer_id in this batch
-print(f"[INFO] Latest-per-key rows in batch: {df_latest.count()}")
-Cell 6 – Split NEW vs CHANGED vs UNCHANGED
-# Read current dimension (only current rows)
-dim_current = spark.table(dim_table).filter(col("is_current") == True)
-
-# Join latest incoming with current dim to detect changes
-join_cond = [col(f"s.{k}") == col(f"d.{k}") for k in key_cols]
-
-df_join = (
-    df_latest.alias("s")
-    .join(dim_current.alias("d"), on=join_cond, how="left")
+# Detect if any keys appear in multiple versions (requires sequential processing)
+keys_per_version = (
+    df_source
+    .groupBy(*key_cols)
+    .agg(spark_max("_commit_version").alias("max_version"))
+    .count()
 )
 
-# Columns to compare for change (SCD attributes)
-compare_cols = data_cols
+total_records = df_source.count()
+requires_sequential = (keys_per_version < total_records)
 
-# Helper: build "no current row" condition generically
-no_current_cond = None
-for k in key_cols:
-    cond = col(f"d.{k}").isNull()
-    no_current_cond = cond if no_current_cond is None else (no_current_cond & cond)
+# Get list of versions for sequential processing (if needed)
+# versions_to_process = (
+#     df_source
+#     .select("_commit_version")
+#     .distinct()
+#     .orderBy("_commit_version")
+#     .rdd.flatMap(lambda x: x).collect()
+# )
 
-# NEW rows: no current dim row for that business key
-df_new = df_join.filter(no_current_cond).select("s.*")
-
-# CHANGED rows: there is a current row AND at least one attribute changed
-change_cond = None
-for c in compare_cols:
-    cond = (col(f"s.{c}") != col(f"d.{c}")) | (col(f"s.{c}").isNull() != col(f"d.{c}").isNull())
-    change_cond = cond if change_cond is None else (change_cond | cond)
-
-has_current_cond = ~no_current_cond  # opposite of "no current row"
-
-df_changed = df_join.filter(has_current_cond & change_cond).select("s.*")
-
-print(f"[INFO] New customers     : {df_new.count()}")
-print(f"[INFO] Changed customers : {df_changed.count()}")
-
-
-Cell 7 – Prepare rows to INSERT for SCD2
-# For SCD2:
-
-# For new keys:
-
-# Insert a new row with is_current = true, effective_start_utc = now, effective_end_utc = null.
-
-# For changed keys:
-
-# End-date old row (is_current = false, effective_end_utc = now).
-
-# Insert a new row with is_current = true, new attributes, new start date.
-
-# First, build the new rows to insert:
-
-                               from pyspark.sql.functions import lit
-
-now_ts = current_timestamp()
-
-# NEW keys → new SCD2 rows
-df_new_scd2 = (
-    df_new
-    .withColumnRenamed("loaded_at_utc", "bronze_loaded_at_utc")
-    .withColumn("effective_start_utc", now_ts)
-    .withColumn("effective_end_utc",   lit(None).cast("timestamp"))
-    .withColumn("is_current",          lit(True))
+# Use toPandas() instead of RDD to be compatible on serverless
+versions_to_process = (
+    df_source
+    .select("_commit_version")
+    .distinct()
+    .orderBy("_commit_version")
+    .toPandas()["_commit_version"]
+    .tolist()
 )
 
-# CHANGED keys → new SCD2 rows (new version)
-df_changed_scd2 = (
-    df_changed
-    .withColumnRenamed("loaded_at_utc", "bronze_loaded_at_utc")
-    .withColumn("effective_start_utc", now_ts)
-    .withColumn("effective_end_utc",   lit(None).cast("timestamp"))
-    .withColumn("is_current",          lit(True))
-)
+print(f"Total changes: {total_records}")
+print(f"Unique keys: {keys_per_version}")
+print(f"Versions in batch: {versions_to_process}")
+print(f"Processing strategy: {'SEQUENTIAL (keys changed multiple times)' if requires_sequential else 'SINGLE MERGE (fast path)'}")
+print(f"\nSample of changes:")
+display(df_source.orderBy("_commit_version", "_commit_timestamp"), 10)
 
-df_to_insert = df_new_scd2.unionByName(df_changed_scd2)
+# COMMAND ----------
 
-print(f"[INFO] Total new SCD2 rows to insert: {df_to_insert.count()}")
+# MAGIC %md
+# MAGIC ###Create insert and update for each delta record to handle Single Merge
 
-Cell 8 – End-date existing current rows for changed keys
+# COMMAND ----------
 
-delta_dim = DeltaTable.forName(spark, dim_table)
+# Prepare insert and update dataframes for MERGE from df_source
+update_df = 
 
-if df_changed.limit(1).count() > 0:
-    # Keys that changed
-    changed_keys = df_changed.select(*key_cols).distinct()
-    end_join = " AND ".join([f"t.{k} = s.{k}" for k in key_cols])
+insert_dict = {
+    **{k: f"source.{k}" for k in key_cols},
+    **{c: f"source.{c}" for c in data_cols},
+    "bronze_loaded_at_utc": "source.loaded_at_utc",
+    "effective_start_utc": "source._commit_timestamp",
+    "effective_end_utc": "to_timestamp('9999-12-31 23:59:59', 'yyyy-MM-dd HH:mm:ss')",
+    "is_current": "true",
+    "_bronze_version": "source._commit_version",
+    "processed_at_utc": "current_timestamp()"
+}
 
-    (
-        delta_dim.alias("t")
-        .merge(
-            changed_keys.alias("s"),
-            end_join
+print("Update dict for MERGE:")
+print(update_dict)
+print("\nInsert dict for MERGE:")
+print(insert_dict)
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell 12
+# MAGIC %md
+# MAGIC ###Execute SCD2 MERGE (Adaptive Strategy)
+# MAGIC
+# MAGIC **Fast Path (Single MERGE)**: When no keys change multiple times across versions
+# MAGIC * Single atomic MERGE operation
+# MAGIC * Best performance
+# MAGIC
+# MAGIC **Sequential Path**: When keys change multiple times across versions
+# MAGIC * Process each version in order
+# MAGIC * Ensures correct SCD2 history for all intermediate changes
+
+# COMMAND ----------
+
+# DBTITLE 1,Untitled
+# Load target Delta table
+delta_dim = DeltaTable.forName(spark, f"{silver_catalog}.{schema_name}.{table_name}_hist")
+
+# Build merge condition: match on business keys AND current rows only
+merge_condition = " AND ".join([f"target.{k} = source.{k}" for k in key_cols])
+merge_condition_with_current = f"{merge_condition} AND target.is_current = true"
+
+print(f"Merge condition: {merge_condition_with_current}\n")
+
+total_rows_processed = 0
+
+if not requires_sequential:
+    # FAST PATH: Single MERGE (no keys change multiple times)
+    print("Using FAST PATH: Single atomic MERGE\n")
+    
+    if df_source.limit(1).count() > 0:
+        (
+            delta_dim.alias("target")
+            .merge(
+                df_source.alias("source"),
+                merge_condition_with_current
+            )
+            .whenMatchedUpdate(
+                set={
+                    "is_current": "false",
+                    "effective_end_utc": "source._commit_timestamp",
+                    "processed_at_utc": "current_timestamp()"
+                }
+            )
+            .whenNotMatchedInsert(
+                values={
+                    **{k: f"source.{k}" for k in key_cols},
+                    **{c: f"source.{c}" for c in data_cols},
+                    "bronze_loaded_at_utc": "source.loaded_at_utc",
+                    "effective_start_utc": "source._commit_timestamp",
+                    "effective_end_utc": "to_timestamp('9999-12-31 23:59:59', 'yyyy-MM-dd HH:mm:ss')",
+                    "is_current": "true",
+                    "_bronze_version": "source._commit_version",
+                    "processed_at_utc": "current_timestamp()"
+                }
+            )
+            .execute()
         )
-        .whenMatchedUpdate(
-            condition="t.is_current = true",
-            set={
-                "is_current": "false",
-                "effective_end_utc": "current_timestamp()"
-            }
-        )
-        .execute()
-    )
-    print(f"[INFO] End-dated current rows for changed keys: {changed_keys.count()}")
+        total_rows_processed = df_source.count()
+        print(f"  ✓ Single MERGE complete: {total_rows_processed} rows")
+
 else:
-    print("[INFO] No changed keys → no end-dates applied")
-Cell 9 – Insert new SCD2 rows
-if df_to_insert.limit(1).count() > 0:
-    (
-        df_to_insert
-        .select(
-            *key_cols,
-            *data_cols,
-            "bronze_loaded_at_utc",
-            "effective_start_utc",
-            "effective_end_utc",
-            "is_current"
-        )
-        .write
-        .format("delta")
-        .mode("append")
-        .saveAsTable(dim_table)
-    )
-    print(f"[INFO] Inserted {df_to_insert.count()} new SCD2 rows")
-else:
-    print("[INFO] No new SCD2 rows to insert")
-Cell 10 – Update CDF status
-status_merge = f"""
-    MERGE INTO {status_table} t
-    USING (
-        SELECT
-            '{source_id}'         AS source_table,
-            {max_version}         AS last_processed_version,
-            current_timestamp()   AS last_processed_timestamp,
-            '{batch_id}'          AS last_batch_id,
-            {versions_proc}       AS versions_processed
-    ) s
-    ON t.source_table = s.source_table
-    WHEN MATCHED THEN UPDATE SET
-        t.last_processed_version   = s.last_processed_version,
-        t.last_processed_timestamp = s.last_processed_timestamp,
-        t.last_batch_id            = s.last_batch_id,
-        t.versions_processed       = s.versions_processed
-    WHEN NOT MATCHED THEN INSERT *
-"""
+    # SEQUENTIAL PATH: Process each version separately (keys change multiple times)
+    print("Using SEQUENTIAL PATH: Processing versions in order\n")
+    
+    for version in versions_to_process:
+        print(f"Processing version {version}...")
+        
+        df_version = df_source.filter(col("_commit_version") == version)
+        
+        if df_version.limit(1).count() > 0:
+            (
+                delta_dim.alias("target")
+                .merge(
+                    df_version.alias("source"),
+                    merge_condition_with_current
+                )
+                .whenMatchedUpdate(
+                    set={
+                        "is_current": "false",
+                        "effective_end_utc": "source._commit_timestamp",
+                        "processed_at_utc": "current_timestamp()"
+                    }
+                )
+                .whenNotMatchedInsert(
+                    values={
+                        **{k: f"source.{k}" for k in key_cols},
+                        **{c: f"source.{c}" for c in data_cols},
+                        "bronze_loaded_at_utc": "source.loaded_at_utc",
+                        "effective_start_utc": "source._commit_timestamp",
+                        "effective_end_utc": "to_timestamp('9999-12-31 23:59:59', 'yyyy-MM-dd HH:mm:ss')",
+                        "is_current": "true",
+                        "_bronze_version": "source._commit_version",
+                        "processed_at_utc": "current_timestamp()"
+                    }
+                )
+                .execute()
+            )
+            
+            version_rows = df_version.count()
+            total_rows_processed += version_rows
+            print(f"  ✓ Version {version}: {version_rows} rows processed")
 
-spark.sql(status_merge)
-print(f"[INFO] Status updated: {start_version} → {max_version}")
-dbutils.notebook.exit("OK")
-
-
+print(f"\n✓ SCD2 MERGE complete")
+print(f"  - Total rows processed: {total_rows_processed}")
+print(f"  - Bronze version range: {start_version} → {max_version}")
